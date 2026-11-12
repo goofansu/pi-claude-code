@@ -709,7 +709,9 @@ function setCacheBreakpoint(message: NativeRequestMessage): void {
   (last as Record<string, unknown>).cache_control = { type: "ephemeral", ttl: "1h" };
 }
 
-function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
+/** Mark the replay's query boundaries; returns the previous query boundary it marked, if any. */
+function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): NativeRequestMessage | undefined {
+  let boundary: NativeRequestMessage | undefined;
   const userIndexes = messages
     .map((message, index) => (message.role === "user" ? index : -1))
     .filter((index) => index >= 0);
@@ -721,10 +723,76 @@ function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
     for (const message of messages) {
       if (message.role === "system") message.content = withoutCacheControl(message.content);
     }
-    setCacheBreakpoint(messages[userIndexes.at(-2)!]!);
+    boundary = messages[userIndexes.at(-2)!]!;
+    setCacheBreakpoint(boundary);
   }
   const final = messages.at(-1);
   if (final) setCacheBreakpoint(final);
+  return boundary;
+}
+
+const MAX_CACHE_BREAKPOINTS = 4;
+
+interface CacheMarker {
+  holder: Record<string, unknown>;
+  message?: NativeRequestMessage;
+}
+
+/**
+ * Blocks in `blocks` that carry a breakpoint. Only protocol positions count:
+ * the blocks themselves and, for tool results, their content blocks. Tool
+ * schemas and tool inputs are user data and are never inspected.
+ */
+function markedBlocks(blocks: unknown, message?: NativeRequestMessage, out: CacheMarker[] = []): CacheMarker[] {
+  if (!Array.isArray(blocks)) return out;
+  for (const block of blocks) {
+    if (!isBlock(block)) continue;
+    if (block.cache_control !== undefined && block.cache_control !== null) out.push({ holder: block, message });
+    if (message && block.type === "tool_result") markedBlocks(block.content, message, out);
+  }
+  return out;
+}
+
+/**
+ * Anthropic rejects a request with more than four breakpoints. Each rewrite
+ * step bounds its own markers, but together they can exceed four: Claude
+ * Code's marker on the newest user message survives the rebuild, and a system
+ * patch injected after it becomes the replay's final message (issue #40).
+ *
+ * Under the limit the request is left alone. Over it, markers are dropped in
+ * this order, earliest first within each group, until four remain:
+ * 1. message markers other than the final one and the previous query boundary
+ *    (the replay reads the cache written by the previous turn there);
+ * 2. the previous query boundary;
+ * 3. tools and system prompt markers, so the latest prefix marker stays.
+ * The final message marker, which writes this turn's cache, is never dropped.
+ */
+function capCacheBreakpoints(
+  payload: { tools?: unknown; system?: unknown; messages?: NativeRequestMessage[]; cache_control?: unknown },
+  boundary: NativeRequestMessage | undefined,
+): void {
+  const prefix = markedBlocks(payload.tools);
+  markedBlocks(payload.system, undefined, prefix);
+  const inMessages: CacheMarker[] = [];
+  for (const message of payload.messages ?? []) {
+    if (isBlock(message)) markedBlocks(message.content, message, inMessages);
+  }
+  const final = inMessages.at(-1);
+  const earlier = inMessages.slice(0, -1);
+  const order = [
+    ...earlier.filter((marker) => marker.message !== boundary),
+    ...earlier.filter((marker) => marker.message === boundary),
+    ...prefix,
+  ];
+  // A request-level marker (automatic caching) takes one of the four slots.
+  const automatic = payload.cache_control === undefined || payload.cache_control === null ? 0 : 1;
+  let excess = automatic + prefix.length + inMessages.length - MAX_CACHE_BREAKPOINTS;
+  for (const marker of order) {
+    if (excess <= 0) break;
+    if (marker === final) continue;
+    delete marker.holder.cache_control;
+    excess -= 1;
+  }
 }
 
 type ContentBlock = Record<string, unknown>;
@@ -856,6 +924,8 @@ export function rewriteInitialRequest(
   const payload = JSON.parse(body.toString("utf8")) as {
     messages?: NativeRequestMessage[];
     system?: unknown;
+    tools?: unknown;
+    cache_control?: unknown;
   };
   let messages = payload.messages;
   const first = messages?.[0];
@@ -884,7 +954,9 @@ export function rewriteInitialRequest(
     payload.messages = messages;
     normalizeLeadingSystemCache(payload.system);
   }
-  if (initialSystemMessages?.length || nativeSystemInjections) setReplayCacheBreakpoints(messages!);
+  const boundary =
+    initialSystemMessages?.length || nativeSystemInjections ? setReplayCacheBreakpoints(messages!) : undefined;
+  capCacheBreakpoints(payload, boundary);
 
   return Buffer.from(JSON.stringify(payload));
 }

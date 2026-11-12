@@ -801,3 +801,151 @@ test("reports upstream 5xx as retryable and keeps 4xx non-retryable", async () =
   assert.match(invalid.message, /Incomplete Claude Code upstream response \(status 400.*upstream said: bad request/);
   assert.equal(invalid.retryable, false);
 });
+
+type WireRequest = { tools?: Block[]; system?: Block[]; messages: WireMessage[] };
+
+/** Breakpoints at the positions Anthropic counts: tools, system, message blocks and tool_result content blocks. */
+function breakpoints(request: WireRequest): string[] {
+  const found: string[] = [];
+  const scan = (blocks: unknown, path: string): void => {
+    if (!Array.isArray(blocks)) return;
+    blocks.forEach((block: Block, index) => {
+      if (block.cache_control) found.push(`${path}[${index}]`);
+      if (block.type === "tool_result") scan(block.content, `${path}[${index}].content`);
+    });
+  };
+  scan(request.tools, "tools");
+  scan(request.system, "system");
+  request.messages.forEach((message, index) => scan(message.content, `messages[${index}]`));
+  return found;
+}
+
+const mark = { type: "ephemeral", ttl: "1h" };
+const markedPrompt = (): Block[] => [
+  { ...text("identity"), cache_control: mark },
+  { ...text("prompt"), cache_control: mark },
+];
+const markedTool = (input_schema: unknown = { type: "object" }): Block => ({
+  name: "mcp__pi__bash",
+  input_schema,
+  cache_control: mark,
+});
+// A real 1x1 PNG, the shape Claude Code sends for a pasted image.
+const png = {
+  type: "image",
+  source: {
+    type: "base64",
+    media_type: "image/png",
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  },
+};
+
+/** Rewrite a request whose Pi history is its own messages without breakpoints. */
+function rewriteRequest(
+  body: WireRequest,
+  initialSystemMessages?: unknown[],
+  injections?: Parameters<typeof rewriteInitialRequest>[3],
+): WireRequest {
+  const frames = framesFor(
+    body.messages.map((message) => ({
+      ...message,
+      content: (message.content as Block[]).map(({ cache_control: _marker, ...block }) => block),
+    })),
+  );
+  return JSON.parse(
+    rewriteInitialRequest(Buffer.from(JSON.stringify(body)), frames, initialSystemMessages, injections).toString("utf8"),
+  ) as WireRequest;
+}
+
+test("sends four breakpoints when a system patch follows a marked image message (issue #40)", () => {
+  const environment = { role: "system", content: [{ ...text("environment"), cache_control: mark }] };
+  const patch = [text("<mcp_servers>changed</mcp_servers>")];
+  const body: WireRequest = {
+    system: markedPrompt(),
+    tools: [markedTool()],
+    messages: [
+      { role: "user", content: [text("first")] },
+      environment,
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "mcp__pi__bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "out" }] },
+      { role: "assistant", content: [text("answer")] },
+      // Claude Code marks the newest user message; Pi's system patch then lands after it.
+      { role: "user", content: [text("look at this"), { ...png, cache_control: mark }] },
+    ],
+  };
+  const rewritten = rewriteRequest(body, [environment], [{ beforeAssistant: null, content: patch }]);
+
+  // Tools and prompt prefix, the previous query boundary, and the final message.
+  assert.deepEqual(breakpoints(rewritten), ["tools[0]", "system[1]", "messages[3][0]", "messages[6][0]"]);
+  assert.deepEqual(withoutMarkers(rewritten), {
+    ...(withoutMarkers(body) as WireRequest),
+    messages: [...(withoutMarkers(body.messages) as WireMessage[]), { role: "system", content: patch }],
+  });
+});
+
+test("keeps the prefix and the latest message breakpoint when a request carries more than four", () => {
+  const body: WireRequest = {
+    system: markedPrompt(),
+    tools: [markedTool()],
+    messages: [
+      { role: "user", content: [{ ...text("first"), cache_control: mark }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "mcp__pi__bash", input: {} }] },
+      {
+        role: "user",
+        // A breakpoint inside a tool result counts toward the limit too.
+        content: [{ type: "tool_result", tool_use_id: "t1", content: [{ ...text("out"), cache_control: mark }] }],
+      },
+      { role: "assistant", content: [text("answer")] },
+      { role: "user", content: [{ ...text("second"), cache_control: mark }] },
+    ],
+  };
+  const rewritten = rewriteRequest(body);
+
+  assert.deepEqual(breakpoints(rewritten), ["tools[0]", "system[0]", "system[1]", "messages[4][0]"]);
+  assert.deepEqual(withoutMarkers(rewritten), withoutMarkers(body));
+});
+
+test("keeps the final message and the latest prompt breakpoints when the prompt alone exceeds four", () => {
+  const body: WireRequest = {
+    system: ["a", "b", "c", "d"].map((value) => ({ ...text(value), cache_control: mark })),
+    tools: [markedTool()],
+    messages: [{ role: "user", content: [{ ...text("only"), cache_control: mark }] }],
+  };
+  const rewritten = rewriteRequest(body);
+
+  assert.deepEqual(breakpoints(rewritten), ["system[1]", "system[2]", "system[3]", "messages[0][0]"]);
+  assert.deepEqual(withoutMarkers(rewritten), withoutMarkers(body));
+});
+
+test("leaves tool schema properties and tool inputs named cache_control alone", () => {
+  const schema = { type: "object", properties: { cache_control: { type: "string" } } };
+  const input = { cache_control: "user value", nested: { cache_control: { type: "ephemeral" } } };
+  const body: WireRequest = {
+    system: markedPrompt(),
+    tools: [markedTool(schema)],
+    messages: [
+      { role: "user", content: [{ ...text("first"), cache_control: mark }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "mcp__pi__bash", input }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "out", cache_control: mark }] },
+    ],
+  };
+  const rewritten = rewriteRequest(body);
+
+  // Over the limit, so the cap runs: the earliest message breakpoint goes, the payload fields stay.
+  assert.deepEqual(breakpoints(rewritten), ["tools[0]", "system[0]", "system[1]", "messages[2][0]"]);
+  assert.deepEqual(rewritten.tools![0]!.input_schema, schema);
+  assert.deepEqual((rewritten.messages[1]!.content as Block[])[0]!.input, input);
+});
+
+test("sends a request within the breakpoint limit unchanged", () => {
+  const body: WireRequest = {
+    system: markedPrompt(),
+    tools: [markedTool()],
+    messages: [
+      { role: "user", content: [text("first")] },
+      { role: "assistant", content: [text("answer")] },
+      { role: "user", content: [text("look at this"), { ...png, cache_control: mark }] },
+    ],
+  };
+  assert.deepEqual(rewriteRequest(body), body);
+});
