@@ -181,17 +181,39 @@ export async function captureProcess(
   child.stdout?.on("data", (chunk: string) => (stdout = (stdout + chunk).slice(-1_000_000)));
   child.stderr?.on("data", (chunk: string) => (stderr = (stderr + chunk).slice(-65_536)));
 
-  const abort = () => killProcessTree(child);
-  signal?.addEventListener("abort", abort, { once: true });
-  const timer = setTimeout(abort, timeoutMs);
-  try {
-    const code = await childExit(child);
-    signal?.throwIfAborted();
-    return { code, stdout, stderr };
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", abort);
-  }
+  const code = await new Promise<number>((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      // Keep the one-shot child listeners: cancellation can precede a queued
+      // spawn error, which must still have an error listener.
+    };
+    const error = (cause: unknown) => {
+      cleanup();
+      reject(cause);
+    };
+    const close = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      if (code !== null) resolve(code);
+      else reject(new Error(`Claude Code exited from signal ${signal ?? "unknown"}`));
+    };
+    const stop = (cause: unknown) => {
+      killProcessTree(child);
+      // Descendants may retain these pipes even after the direct child exits.
+      // Do not let waiting for their EOF defeat cancellation or the deadline.
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      error(cause);
+    };
+    const abort = () => stop(signal!.reason);
+    const timer = setTimeout(() => stop(new Error(`Claude Code command timed out after ${timeoutMs}ms`)), timeoutMs);
+    signal?.addEventListener("abort", abort, { once: true });
+    child.once("error", error);
+    // `exit` only ends the process; `close` also waits for captured stdio.
+    child.once("close", close);
+  });
+  signal?.throwIfAborted();
+  return { code, stdout, stderr };
 }
 
 function outputTail(text: string, limit = 500): string {
