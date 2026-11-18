@@ -87,10 +87,13 @@ test("auth status waits for JSON after process exit", { skip: process.platform =
   try {
     await writeFile(command, `#!${process.execPath}\n${delayedOutput(JSON.stringify({ loggedIn: true, subscriptionType: "max" }))}`);
     await chmod(command, 0o755);
-    const status = await getClaudeStatus({ ...env, PI_CLAUDE_CODE_COMMAND: command });
-    assert.equal(status.loggedIn, true, status.detail);
-    assert.equal(status.subscription, true);
-    assert.equal(status.diagnostic, undefined);
+    const statuses = await Promise.all(Array.from({ length: 12 }, () =>
+      getClaudeStatus({ ...env, PI_CLAUDE_CODE_COMMAND: command })));
+    for (const status of statuses) {
+      assert.equal(status.loggedIn, true, status.detail);
+      assert.equal(status.subscription, true);
+      assert.equal(status.diagnostic, undefined);
+    }
 
     // Waiting for output must not turn real CLI failures into logged-in success.
     for (const [stdout, stderr, expected] of [
