@@ -239,12 +239,76 @@ function statusPayload(stdout: string): Record<string, unknown> | undefined {
   return undefined;
 }
 
+interface PendingClaudeStatus {
+  controller: AbortController;
+  result: Promise<ClaudeStatus>;
+  waiters: number;
+}
+
+// In-flight only: never retain a completed status (including logout/failure) or
+// environment. Fingerprint the entire child environment, not just known Claude
+// settings: wrappers can depend on arbitrary variables. Keep Windows spelling
+// and duplicate-name order, since envValue's fallback can depend on that order.
+const pendingClaudeStatuses = new Map<string, PendingClaudeStatus>();
+
 export async function getClaudeStatus(
   envInput: Record<string, string | undefined> = process.env,
   signal?: AbortSignal,
 ): Promise<ClaudeStatus> {
+  signal?.throwIfAborted();
   const env = claudeEnvironment(envInput);
+  const entries = Object.entries(env).sort(([a], [b]) => {
+    if (process.platform === "win32") {
+      a = a.toUpperCase();
+      b = b.toUpperCase();
+    }
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  const key = createHash("sha256").update(JSON.stringify([
+    process.cwd(), entries,
+    // spawnCommand can fall back to the parent's cmd.exe even with an explicit env.
+    process.platform === "win32" ? process.env.COMSPEC : undefined,
+  ])).digest("hex");
+  let pending = pendingClaudeStatuses.get(key);
+  if (!pending) {
+    const controller = new AbortController();
+    const result = checkClaudeStatus(env, controller.signal).finally(() => {
+      // The last cancellation may already have removed this check and a new
+      // caller started its replacement. Never evict that replacement.
+      if (pendingClaudeStatuses.get(key) === pending) pendingClaudeStatuses.delete(key);
+    });
+    pending = { controller, result, waiters: 0 };
+    pendingClaudeStatuses.set(key, pending);
+  }
+  const check = pending;
+  check.waiters++;
+  return new Promise<ClaudeStatus>((resolve, reject) => {
+    let active = true;
+    const leave = () => {
+      if (!active) return false;
+      active = false;
+      signal?.removeEventListener("abort", abort);
+      check.waiters--;
+      if (check.waiters === 0 && pendingClaudeStatuses.get(key) === check) {
+        pendingClaudeStatuses.delete(key);
+        check.controller.abort();
+      }
+      return true;
+    };
+    const abort = () => {
+      if (leave()) reject(signal!.reason);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    check.result.then(
+      (status) => { if (leave()) resolve({ ...status }); },
+      (error) => { if (leave()) reject(error); },
+    );
+  });
+}
+
+async function checkClaudeStatus(env: Record<string, string>, signal: AbortSignal): Promise<ClaudeStatus> {
   const command = await resolveClaudeExecutable(env);
+  signal.throwIfAborted();
   if (!command) return { available: false, loggedIn: false, subscription: false, detail: INSTALL_HINT };
 
   let result: { code: number; stdout: string; stderr: string };
